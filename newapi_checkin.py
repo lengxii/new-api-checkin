@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 通用 API 站点签到脚本
-用法: python elysiver_checkin.py --url 'https://example.com/' --session 'xxx' [--cf 'yyy'] [--user-id 6508] [--access-token token]
+用法: python newapi_checkin.py --url 'https://example.com/' --session 'xxx' [--cf 'yyy'] [--user-id 6508] [--access-token token]
 """
 
 import argparse

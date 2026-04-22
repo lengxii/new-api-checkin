@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 
 SITES_FILE = Path.home() / '.hermes' / 'api_sites.json'
 STATUS_FILE = Path.home() / '.hermes' / 'api_checkin_status.json'
-CHECKIN_SCRIPT = Path('/root/scripts/elysiver_checkin.py')
+CHECKIN_SCRIPT = Path('/root/scripts/newapi_checkin.py')
 VENV_PYTHON = Path.home() / '.venvs' / 'scrapling' / 'bin' / 'python'
 FALLBACK_PYTHON = 'python3'
 
@@ -375,7 +375,7 @@ def run_status_probe(site: dict, python_cmd):
 import json
 import sys
 sys.path.insert(0, '/root/scripts')
-import elysiver_checkin as ec
+import newapi_checkin as ec
 
 site = json.loads(sys.argv[1])
 sess = ec.create_requests_session(
