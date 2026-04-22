@@ -28,7 +28,7 @@ python -m patchright install chromium
 ### 直接签到单个站点
 
 ```bash
-python elysiver_checkin.py \
+python newapi_checkin.py \
   --url 'https://example.com/' \
   --session 'your_session_cookie' \
   --user-id 1234 \
