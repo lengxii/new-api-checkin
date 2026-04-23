@@ -30,6 +30,9 @@ CHECKIN_SCRIPT = Path('/root/scripts/newapi_checkin.py')
 VENV_PYTHON = Path.home() / '.venvs' / 'scrapling' / 'bin' / 'python'
 FALLBACK_PYTHON = 'python3'
 
+# Import shared normalize_url from newapi_checkin (lenient wrapper)
+sys.path.insert(0, '/root/scripts')
+import newapi_checkin as _ec
 KNOWN_DOMAINS = {
     'elysiver.h-e.top': 'elysiver',
     'windhub.cc': 'windhub',
@@ -121,6 +124,8 @@ def cache_status_from_probe(site_name: str, status_info: dict):
     elif classification in {'security_verification_required', 'pow_required', 'cloudflare_challenge'}:
         state = 'verification_required'
     elif classification in {'auth_failed', 'request_failed', 'empty_response'}:
+        state = 'error'
+    elif classification == 'status_probe_failed':
         state = 'error'
 
     if not state:
@@ -249,18 +254,11 @@ def extract_domain_from_session(session: str) -> str:
 
 
 def normalize_url(url: str) -> str:
-    raw = (url or '').strip()
-    if not raw:
+    """Lenient wrapper: returns '' instead of raising ValueError."""
+    try:
+        return _ec.normalize_url(url)
+    except (ValueError, Exception):
         return ''
-    if '://' not in raw:
-        raw = f'https://{raw}'
-    parsed = urlparse(raw)
-    host = sanitize_host(parsed.netloc or parsed.path)
-    if not host:
-        return ''
-    path = parsed.path if parsed.netloc else ''
-    path = path or '/'
-    return f'{parsed.scheme or "https"}://{host}{path if path.startswith("/") else "/" + path}'
 
 
 def guess_site_name(url: str) -> str:
@@ -392,40 +390,14 @@ if result.get('ok') and result.get('already_checked_in') is False:
     result['classification'] = 'not_checked_in'
     result['source'] = 'status-probe'
 elif not result.get('ok') or result.get('already_checked_in') is not True:
-    payload = ec.checkin_via_requests(
-        site['url'],
-        site['session'],
-        site.get('cf', ''),
-        site.get('user_id', ''),
-        site.get('access_token', ''),
-    )
-    cls = ec.classify_result(payload.get('status', 0), payload.get('body'), payload.get('debug'))
-    if cls.get('kind') == 'already_checked_in':
-        result = {
-            'ok': True,
-            'url': ec.build_checkin_url(site['url']),
-            'already_checked_in': True,
-            'message': cls.get('message') or '今日已签到',
-            'classification': cls.get('kind'),
-            'source': 'checkin-response',
-        }
-    elif cls.get('kind') in {'security_verification_required', 'pow_required', 'cloudflare_challenge', 'auth_failed', 'request_failed', 'empty_response', 'unknown'}:
-        result = {
-            'ok': False,
-            'url': ec.build_checkin_url(site['url']),
-            'message': cls.get('message') or result.get('message') or '未发现可用签到状态字段',
-            'classification': cls.get('kind') or 'unknown',
-            'source': 'checkin-probe',
-        }
+    if result.get('ok'):
+        result.setdefault('already_checked_in', False)
+        result.setdefault('classification', 'not_checked_in')
     else:
-        result = {
-            'ok': True,
-            'url': ec.build_checkin_url(site['url']),
-            'already_checked_in': False,
-            'message': cls.get('message') or '未签到',
-            'classification': 'not_checked_in',
-            'source': 'checkin-probe',
-        }
+        result.setdefault('already_checked_in', None)
+        result.setdefault('classification', 'status_probe_failed')
+        result.setdefault('message', result.get('message') or '状态探测失败')
+    result['source'] = 'status-probe'
 
 print(json.dumps(result, ensure_ascii=False))
 """.strip()
@@ -491,6 +463,8 @@ def format_status_icon(status_info: dict) -> str:
         return '⬜'
     if classification in {'security_verification_required', 'pow_required', 'cloudflare_challenge'}:
         return '🔒'
+    if classification == 'status_probe_failed':
+        return '❔'
     if classification == 'not_checked_in':
         return '⬜'
     if classification in {'auth_failed', 'request_failed', 'empty_response'}:
@@ -509,6 +483,8 @@ def format_status_text(status_info: dict) -> str:
         return '未签到'
     if classification == 'not_checked_in':
         return '未签到'
+    if classification == 'status_probe_failed':
+        return f'探测失败({message})' if message else '探测失败'
     if classification == 'security_verification_required':
         return '需安全验证'
     if classification == 'pow_required':
@@ -797,9 +773,11 @@ def cmd_qd(raw: str):
             if is_checkin_success(completed, output):
                 success_count += 1
                 if success_state:
+                    classification = 'already_checked_in' if success_state == 'already_checked_in' else 'success'
                     update_cached_status(site['name'], {
                         'date': today,
                         'state': success_state,
+                        'classification': classification,
                         'message': '今日已签到' if success_state == 'already_checked_in' else '签到成功',
                         'updated_at': subprocess.run(
                             ['date', '+%F %T'],

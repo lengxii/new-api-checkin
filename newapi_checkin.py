@@ -18,6 +18,7 @@ from scrapling.fetchers import StealthyFetcher
 
 CHECKIN_PATH = '/api/user/checkin'
 REQUEST_TIMEOUT = 30
+MAX_POW_NONCE = 1_000_000
 
 
 def normalize_url(url: str) -> str:
@@ -73,7 +74,7 @@ def create_requests_session(base_url: str, session: str, cf_clearance: str = '',
     sess.headers.update(headers)
     sess.cookies.set('session', session, domain=host, path='/')
     sess.cookies.set('session', session, path='/')
-    if cf_clearance:
+    if cf_clearance and cf_clearance.lower() not in ('placeholder', 'none', 'null', 'empty', ''):
         sess.cookies.set('cf_clearance', cf_clearance, domain=host, path='/')
         sess.cookies.set('cf_clearance', cf_clearance, path='/')
     return sess
@@ -114,7 +115,7 @@ def classify_result(status: int, body, debug: dict | None = None) -> dict:
         return {'kind': 'pow_required', 'message': message or '需要 PoW 验证'}
     if '安全验证' in message or 'captcha' in lowered:
         code = body.get('code') if isinstance(body, dict) else ''
-        if code == 'pow_required' or debug.get('powEnabled') or debug.get('powMode') or 'pow' in lowered_body:
+        if code == 'pow_required' or 'pow' in lowered_body:
             return {'kind': 'pow_required', 'message': message or '需要 PoW 验证'}
         return {'kind': 'security_verification_required', 'message': message or '需要安全验证'}
     if 'turnstile' in lowered:
@@ -218,7 +219,7 @@ def solve_pow_requests(base_url: str, req_session: requests.Session) -> dict:
     if '/api/pow/challenge' in challenge_url and 'prefix' not in data:
         nonce = 0
         prefix_zeroes = '0' * difficulty
-        while nonce <= 0xFFFFFFFF:
+        while nonce <= MAX_POW_NONCE:
             digest = hashlib.sha256(f'{prefix}{nonce}'.encode()).hexdigest()
             if digest.startswith(prefix_zeroes):
                 pow_token_payload = {
@@ -259,7 +260,7 @@ def solve_pow_requests(base_url: str, req_session: requests.Session) -> dict:
     extra_bits = difficulty % 8
     mask = ((0xFF << (8 - extra_bits)) & 0xFF) if extra_bits else 0
     nonce = 0
-    while nonce <= 0xFFFFFFFF:
+    while nonce <= MAX_POW_NONCE:
         nonce_hex = f'{nonce:08x}'
         digest = hashlib.sha256(prefix_bytes + nonce_hex.encode()).digest()
         ok = all(b == 0 for b in digest[:full_bytes])
@@ -305,6 +306,19 @@ def build_checkin_request(normalized_url: str, pow_payload: dict | None = None) 
 
 
 def checkin_via_requests(site_url: str, session: str, cf_clearance: str = '', user_id: str = '', access_token: str = '') -> dict:
+    try:
+        return _checkin_via_requests_impl(site_url, session, cf_clearance, user_id, access_token)
+    except requests.exceptions.SSLError as exc:
+        return {'status': 0, 'body': {'success': False, 'message': f'SSL 错误: {exc}'}, 'debug': {'mode': 'requests', 'stage': 'ssl-error', 'error': str(exc)}}
+    except requests.exceptions.ConnectionError as exc:
+        return {'status': 0, 'body': {'success': False, 'message': f'连接失败: {exc}'}, 'debug': {'mode': 'requests', 'stage': 'connection-error', 'error': str(exc)}}
+    except requests.exceptions.Timeout:
+        return {'status': 0, 'body': {'success': False, 'message': '请求超时'}, 'debug': {'mode': 'requests', 'stage': 'timeout'}}
+    except Exception as exc:
+        return {'status': 0, 'body': {'success': False, 'message': f'请求异常: {exc}'}, 'debug': {'mode': 'requests', 'stage': 'unknown-error', 'error': str(exc)}}
+
+
+def _checkin_via_requests_impl(site_url: str, session: str, cf_clearance: str = '', user_id: str = '', access_token: str = '') -> dict:
     normalized_url = normalize_url(site_url)
     req_session = create_requests_session(normalized_url, session, cf_clearance, user_id, access_token)
 
@@ -645,15 +659,22 @@ def checkin_via_browser(site_url: str, session: str, cf_clearance: str = '', use
     if cf_clearance:
         cookies.append({'name': 'cf_clearance', 'value': cf_clearance, 'domain': cookie_domain, 'path': '/'})
 
-    StealthyFetcher.fetch(
-        normalized_url,
-        headless=True,
-        solve_cloudflare=True,
-        cookies=cookies,
-        load_dom=True,
-        wait=5000,
-        page_action=page_action,
-    )
+    try:
+        StealthyFetcher.fetch(
+            normalized_url,
+            headless=True,
+            solve_cloudflare=True,
+            cookies=cookies,
+            load_dom=True,
+            wait=5000,
+            page_action=page_action,
+        )
+    except Exception as exc:
+        return {
+            'status': 0,
+            'body': {'success': False, 'message': f'浏览器签到失败: {exc}'},
+            'debug': {'mode': 'browser', 'stage': 'browser-error', 'error': str(exc)},
+        }
 
     return result
 
@@ -689,7 +710,14 @@ def checkin(site_url: str, session: str, cf_clearance: str = '', user_id: str = 
         return requests_result
 
     if should_fallback_to_browser(requests_result):
-        browser_result = checkin_via_browser(site_url, session, cf_clearance, user_id, access_token)
+        try:
+            browser_result = checkin_via_browser(site_url, session, cf_clearance, user_id, access_token)
+        except Exception as exc:
+            browser_result = {
+                'status': 0,
+                'body': {'success': False, 'message': f'浏览器回退异常: {exc}'},
+                'debug': {'mode': 'browser', 'stage': 'fallback-error', 'error': str(exc)},
+            }
         if browser_result:
             browser_result.setdefault('debug', {})
             if isinstance(browser_result['debug'], dict):
@@ -741,8 +769,9 @@ def main():
         print(f'状态码: {status}')
         print(f'结果: {msg}')
         print(f"分类: {classification.get('kind')}")
-        if 'quota_awarded' in body.get('data', {}):
-            print(f"奖励额度: {body['data']['quota_awarded']}")
+        data = body.get('data') or {}
+        if 'quota_awarded' in data:
+            print(f"奖励额度: {data['quota_awarded']}")
         if result.get('debug'):
             print(f"调试: {json.dumps(result['debug'], ensure_ascii=False, sort_keys=True)}")
         if success:
