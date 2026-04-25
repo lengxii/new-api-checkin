@@ -7,6 +7,7 @@ New API / Ark API 多站点自动签到工具，支持 Telegram Bot 快捷命令
 - 🔐 **requests 优先**：纯 HTTP 签到，无需浏览器
 - 🌐 **Cloudflare 自动 fallback**：遇到 CF challenge 自动切换 Scrapling 浏览器
 - 🧩 **PoW 安全验证**：自动解 PoW challenge（query 模式 + x-pow-token 模式）
+- 🖥️ **CDP Turnstile 回退**：Scrapling headless 无法初始化 Turnstile 时，通过桌面 Chrome 获取 token
 - 📦 **多站点批量签到**：一个命令签到所有站点
 - 📊 **签到状态缓存**：本地记录签到结果，避免重复请求
 - 🤖 **Telegram 快捷命令**：`api qd` / `api list` / `api add` / `api del`
@@ -14,13 +15,20 @@ New API / Ark API 多站点自动签到工具，支持 Telegram Bot 快捷命令
 ## 依赖
 
 ```bash
-pip install requests scrapling
+pip install requests scrapling websockets
 ```
 
 Scrapling 浏览器（仅 CF fallback 需要）：
 
 ```bash
 python -m patchright install chromium
+```
+
+桌面 Chrome（仅 CDP Turnstile 回退需要）：
+
+```bash
+# 启动 Chrome 并开启远程调试端口
+google-chrome-stable --remote-debugging-port=9222 --no-sandbox
 ```
 
 ## 使用
@@ -88,8 +96,15 @@ python api_checkin.py del 站点名
   ├─ 成功 / 已签到 → 直接返回
   ├─ 需要 PoW → 自动求解 → 重试
   ├─ Cloudflare challenge → Scrapling 浏览器 fallback
+  ├─ Turnstile token 为空 → CDP 连接桌面 Chrome 获取 token
+  │   └─ 同时检测 PoW → 获取 challenge → 一起提交
   └─ 其他错误 → 返回错误信息
 ```
+
+## 已知限制
+
+- **Turnstile 在 headless 浏览器中无法初始化**：Scrapling 的 headless Chrome 无法通过 Turnstile 验证，需要桌面 Chrome 通过 CDP 协议获取 token
+- **CDP 回退需要桌面 Chrome 运行**：必须先启动 `google-chrome-stable --remote-debugging-port=9222`
 
 ## License
 
