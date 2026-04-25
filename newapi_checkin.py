@@ -8,6 +8,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import sys
 import time
 from urllib.parse import urlencode, urlparse
@@ -465,16 +466,27 @@ def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
         import urllib.request
 
         # 检查 Chrome 是否运行
+        chrome_running = False
         try:
             resp = urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=3)
             resp.read()
-        except Exception:
+            chrome_running = True
+            print('CDP: Chrome 已运行', flush=True)
+        except Exception as e:
+            print(f'CDP: Chrome 未运行 ({type(e).__name__})', flush=True)
+
+        if not chrome_running:
+            # 不自动启动 Chrome —— 用空 profile 启动的 Chrome 没有 cookie/登录态，
+            # Turnstile 会拒绝。提示用户用带 --remote-debugging-port 的方式启动自己的 Chrome。
+            print(f'CDP: Chrome 不可用（localhost:{CDP_PORT}）。请先启动: google-chrome-stable --remote-debugging-port={CDP_PORT}', flush=True)
+            print('CDP: 提示: 需要用你自己的 Chrome（有 cookie/登录态），不要用空 profile', flush=True)
             return ''
 
         # 获取或创建 tab
         try:
             resp = urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/list', timeout=3)
             tabs = json.loads(resp.read())
+            print(f'CDP: 找到 {len(tabs)} 个 tab', flush=True)
             # 找到一个可用的 tab
             ws_url = None
             for tab in tabs:
@@ -482,8 +494,26 @@ def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
                     ws_url = tab.get('webSocketDebuggerUrl')
                     break
             if not ws_url:
-                return ''
-        except Exception:
+                # 没有 page tab，尝试创建一个
+                print('CDP: 没有 page tab，尝试创建新 tab...', flush=True)
+                try:
+                    create_req = urllib.request.Request(
+                        f'http://localhost:{CDP_PORT}/json/new?about:blank',
+                        method='PUT',
+                    )
+                    create_resp = urllib.request.urlopen(create_req, timeout=5)
+                    new_tab = json.loads(create_resp.read())
+                    ws_url = new_tab.get('webSocketDebuggerUrl')
+                    if ws_url:
+                        print(f'CDP: 创建新 tab 成功', flush=True)
+                    else:
+                        print('CDP: 创建 tab 失败（无 ws_url）', flush=True)
+                        return ''
+                except Exception as exc:
+                    print(f'CDP: 创建 tab 失败: {exc}', flush=True)
+                    return ''
+        except Exception as exc:
+            print(f'CDP: 获取 tab 列表失败: {exc}', flush=True)
             return ''
 
         async with websockets.connect(ws_url, close_timeout=5) as ws:
@@ -526,7 +556,9 @@ def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
             await ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": js_check, "awaitPromise": True}}))
             resp = await asyncio.wait_for(ws.recv(), timeout=20)
             status = json.loads(resp).get('result', {}).get('result', {}).get('value', '')
+            print(f'CDP: Turnstile 加载状态: {status}', flush=True)
             if status != 'loaded':
+                print(f'CDP: Turnstile 未加载 (status={status})，跳过', flush=True)
                 return ''
 
             # 渲染 Turnstile 并获取 token
@@ -566,8 +598,10 @@ def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
             try:
                 resp = await asyncio.wait_for(ws.recv(), timeout=CDP_TIMEOUT)
                 token = json.loads(resp).get('result', {}).get('result', {}).get('value', '')
+                print(f'CDP: 获取到 token: {repr(token[:40] if token else "<empty>")}', flush=True)
                 return token or ''
-            except:
+            except Exception as exc:
+                print(f'CDP: 等待 token 超时或异常: {exc}', flush=True)
                 return ''
 
     try:
