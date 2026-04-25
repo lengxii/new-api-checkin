@@ -17,6 +17,7 @@ API 签到站点管理 - Telegram 交互脚本
 import argparse
 import base64
 import json
+import os
 import subprocess
 import sys
 import re
@@ -29,6 +30,15 @@ STATUS_FILE = Path.home() / '.hermes' / 'api_checkin_status.json'
 CHECKIN_SCRIPT = Path('/root/scripts/newapi_checkin.py')
 VENV_PYTHON = Path.home() / '.venvs' / 'scrapling' / 'bin' / 'python'
 FALLBACK_PYTHON = 'python3'
+PATCHRIGHT_BROWSERS = Path.home() / '.cache' / 'patchright-browsers'
+
+
+def _env_with_patchright() -> dict:
+    """Return os.environ copy with PLAYWRIGHT_BROWSERS_PATH set to patchright cache."""
+    env = os.environ.copy()
+    env['PLAYWRIGHT_BROWSERS_PATH'] = str(PATCHRIGHT_BROWSERS)
+    return env
+
 
 # Import shared normalize_url from newapi_checkin (lenient wrapper)
 sys.path.insert(0, '/root/scripts')
@@ -413,6 +423,7 @@ print(json.dumps(result, ensure_ascii=False))
         text=True,
         timeout=60,
         cwd='/root',
+        env=_env_with_patchright(),
     )
 
 
@@ -681,6 +692,7 @@ def run_checkin(site: dict, python_cmd, *, user_id_override=None):
         text=True,
         timeout=120,
         cwd='/root',
+        env=_env_with_patchright(),
     )
 
 

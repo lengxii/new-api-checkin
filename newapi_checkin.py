@@ -19,6 +19,8 @@ from scrapling.fetchers import StealthyFetcher
 CHECKIN_PATH = '/api/user/checkin'
 REQUEST_TIMEOUT = 30
 MAX_POW_NONCE = 1_000_000
+CDP_PORT = 9222
+CDP_TIMEOUT = 45
 
 
 def normalize_url(url: str) -> str:
@@ -450,6 +452,135 @@ def _checkin_via_requests_impl(site_url: str, session: str, cf_clearance: str = 
     }
 
 
+def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
+    """通过 CDP 连接桌面 Chrome 获取 Turnstile token"""
+    import asyncio
+
+    try:
+        import websockets
+    except ImportError:
+        return ''
+
+    async def _get_token():
+        import urllib.request
+
+        # 检查 Chrome 是否运行
+        try:
+            resp = urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=3)
+            resp.read()
+        except Exception:
+            return ''
+
+        # 获取或创建 tab
+        try:
+            resp = urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/list', timeout=3)
+            tabs = json.loads(resp.read())
+            # 找到一个可用的 tab
+            ws_url = None
+            for tab in tabs:
+                if tab.get('type') == 'page':
+                    ws_url = tab.get('webSocketDebuggerUrl')
+                    break
+            if not ws_url:
+                return ''
+        except Exception:
+            return ''
+
+        async with websockets.connect(ws_url, close_timeout=5) as ws:
+            # 导航到站点
+            msg = {"id": 1, "method": "Page.navigate", "params": {"url": site_url}}
+            await ws.send(json.dumps(msg))
+
+            # 等待页面加载
+            for _ in range(10):
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=2)
+                except:
+                    break
+
+            await asyncio.sleep(3)
+
+            # 检查 Turnstile 是否已加载，如果没有则加载
+            js_check = """
+            (async function() {
+                if (window.turnstile) return 'loaded';
+                // 尝试加载 Turnstile
+                return await new Promise((resolve) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+                    script.async = true;
+                    script.onload = () => {
+                        const poll = (attempts) => {
+                            if (window.turnstile) return resolve('loaded');
+                            if (attempts <= 0) return resolve('failed');
+                            setTimeout(() => poll(attempts - 1), 500);
+                        };
+                        poll(20);
+                    };
+                    script.onerror = () => resolve('error');
+                    document.head.appendChild(script);
+                    setTimeout(() => resolve(!!window.turnstile ? 'loaded' : 'timeout'), 15000);
+                });
+            })()
+            """
+            await ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": js_check, "awaitPromise": True}}))
+            resp = await asyncio.wait_for(ws.recv(), timeout=20)
+            status = json.loads(resp).get('result', {}).get('result', {}).get('value', '')
+            if status != 'loaded':
+                return ''
+
+            # 渲染 Turnstile 并获取 token
+            js_render = f"""
+            (async function() {{
+                return await new Promise((resolve) => {{
+                    const container = document.createElement('div');
+                    container.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+                    document.body.appendChild(container);
+                    let widgetId = null;
+                    let settled = false;
+                    const finish = (value) => {{
+                        if (settled) return;
+                        settled = true;
+                        try {{ if (widgetId !== null) window.turnstile.remove(widgetId); }} catch (e) {{}}
+                        container.remove();
+                        resolve(value || '');
+                    }};
+                    try {{
+                        widgetId = window.turnstile.render(container, {{
+                            sitekey: '{site_key}',
+                            callback: (token) => finish(token),
+                            'error-callback': () => finish(''),
+                            'expired-callback': () => finish(''),
+                            'timeout-callback': () => finish(''),
+                        }});
+                    }} catch (e) {{
+                        finish('');
+                    }}
+                    setTimeout(() => finish(''), 30000);
+                }});
+            }})()
+            """
+            await ws.send(json.dumps({"id": 3, "method": "Runtime.evaluate", "params": {"expression": js_render, "awaitPromise": True}}))
+
+            # 等待 token
+            try:
+                resp = await asyncio.wait_for(ws.recv(), timeout=CDP_TIMEOUT)
+                token = json.loads(resp).get('result', {}).get('result', {}).get('value', '')
+                return token or ''
+            except:
+                return ''
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(_get_token())
+        finally:
+            loop.close()
+    except Exception:
+        return ''
+
+
 def checkin_via_browser(site_url: str, session: str, cf_clearance: str = '', user_id: str = '', access_token: str = '') -> dict:
     result = {}
     normalized_url = normalize_url(site_url)
@@ -550,8 +681,47 @@ def checkin_via_browser(site_url: str, session: str, cf_clearance: str = '', use
                 }}
             }};
 
+            const ensureTurnstileLoaded = async () => {{
+                if (window.turnstile) {{
+                    return true;
+                }}
+                if (!turnstileSiteKey) {{
+                    return false;
+                }}
+                return await new Promise((resolve) => {{
+                    const script = document.createElement('script');
+                    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+                    script.async = true;
+                    script.onload = () => {{
+                        const poll = (attempts) => {{
+                            if (window.turnstile) {{
+                                return resolve(true);
+                            }}
+                            if (attempts <= 0) {{
+                                return resolve(false);
+                            }}
+                            setTimeout(() => poll(attempts - 1), 500);
+                        }};
+                        poll(20);
+                    }};
+                    script.onerror = (e) => {{
+                        resolve(false);
+                    }};
+                    document.head.appendChild(script);
+                    setTimeout(() => {{
+                        resolve(!!window.turnstile);
+                    }}, 15000);
+                }});
+            }};
+
             const getTurnstileToken = async () => {{
-                if (!turnstileEnabled || !turnstileSiteKey || !window.turnstile) return '';
+                if (!turnstileEnabled || !turnstileSiteKey) {{
+                    return '';
+                }}
+                const loaded = await ensureTurnstileLoaded();
+                if (!loaded || !window.turnstile) {{
+                    return '';
+                }}
                 return await new Promise((resolve) => {{
                     const container = document.createElement('div');
                     container.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
@@ -568,15 +738,25 @@ def checkin_via_browser(site_url: str, session: str, cf_clearance: str = '', use
                     try {{
                         widgetId = window.turnstile.render(container, {{
                             sitekey: turnstileSiteKey,
-                            callback: (tokenValue) => finish(tokenValue),
-                            'error-callback': () => finish(''),
-                            'expired-callback': () => finish(''),
-                            'timeout-callback': () => finish(''),
+                            callback: (tokenValue) => {{
+                                finish(tokenValue);
+                            }},
+                            'error-callback': (e) => {{
+                                finish('');
+                            }},
+                            'expired-callback': () => {{
+                                finish('');
+                            }},
+                            'timeout-callback': () => {{
+                                finish('');
+                            }},
                         }});
                     }} catch (error) {{
                         finish('');
                     }}
-                    setTimeout(() => finish(''), 30000);
+                    setTimeout(() => {{
+                        finish('');
+                    }}, 30000);
                 }});
             }};
 
@@ -708,6 +888,68 @@ def checkin(site_url: str, session: str, cf_clearance: str = '', user_id: str = 
             return requests_result
     elif isinstance(body, str) and ('签到成功' in body or '已签到' in body):
         return requests_result
+
+    # 如果 Turnstile 启用但没有 token，尝试通过 CDP 获取
+    debug = requests_result.get('debug') or {}
+    turnstile_enabled = debug.get('turnstileEnabled', False)
+    turnstile_provided = debug.get('turnstileProvided', False)
+    turnstile_site_key = debug.get('turnstileSiteKey', '')
+
+    if turnstile_enabled and not turnstile_provided and turnstile_site_key:
+        print('尝试通过桌面 Chrome 获取 Turnstile token...')
+        cdp_token = get_turnstile_token_via_cdp(site_url, turnstile_site_key)
+        if cdp_token:
+            print(f'CDP Turnstile token 获取成功: {cdp_token[:30]}...')
+            # 使用 CDP token 重新签到
+            normalized_url = normalize_url(site_url)
+            req_session = create_requests_session(normalized_url, session, cf_clearance, user_id, access_token)
+            
+            # 检查是否需要 PoW
+            pow_enabled = debug.get('powEnabled', False)
+            pow_payload = None
+            if pow_enabled:
+                print('检测到 PoW 启用，正在获取 challenge...')
+                pow_payload = solve_pow_requests(normalized_url, req_session)
+                if not pow_payload.get('ok'):
+                    print(f'PoW 获取失败: {pow_payload.get("message", "")}')
+                    pow_payload = None
+            
+            checkin_path = build_checkin_path(cdp_token, pow_payload)
+            checkin_url = f'{normalized_url.rstrip("/")}{checkin_path}'
+            
+            # 如果有 PoW，添加 X-Pow-Token header
+            request_headers = {}
+            if pow_payload and pow_payload.get('mode') == 'x-pow-token':
+                import base64 as b64
+                pow_token_payload = dict(pow_payload.get('pow_token_payload') or {})
+                pow_token_payload['ts'] = int(time.time() * 1000)
+                request_headers['X-Pow-Token'] = b64.b64encode(json.dumps(pow_token_payload, separators=(',', ':')).encode()).decode()
+            
+            try:
+                resp = req_session.post(checkin_url, headers=request_headers or None, timeout=REQUEST_TIMEOUT)
+                cdp_body = parse_json_response(resp)
+                if cdp_body is None:
+                    cdp_body = resp.text
+                cdp_result = {
+                    'status': resp.status_code,
+                    'body': cdp_body,
+                    'response_url': resp.url,
+                    'debug': {
+                        'mode': 'requests+cdp',
+                        'turnstileEnabled': turnstile_enabled,
+                        'turnstileProvided': True,
+                        'turnstileSiteKey': turnstile_site_key,
+                        'cdpToken': cdp_token[:30] + '...',
+                        'powEnabled': pow_enabled,
+                        'powPayload': pow_payload,
+                    },
+                }
+                cdp_result['classification'] = classify_result(resp.status_code, cdp_body, cdp_result.get('debug'))
+                return cdp_result
+            except Exception as exc:
+                print(f'CDP 签到失败: {exc}')
+        else:
+            print('CDP Turnstile token 获取失败')
 
     if should_fallback_to_browser(requests_result):
         try:
