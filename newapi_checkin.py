@@ -463,156 +463,172 @@ def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
         return ''
 
     async def _get_token():
-        import urllib.request
+        import urllib.request as _urlreq
 
         # 检查 Chrome 是否运行
-        chrome_running = False
         try:
-            resp = urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=3)
-            resp.read()
-            chrome_running = True
+            _urlreq.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=3)
             print('CDP: Chrome 已运行', flush=True)
         except Exception as e:
-            print(f'CDP: Chrome 未运行 ({type(e).__name__})', flush=True)
-
-        if not chrome_running:
-            # 不自动启动 Chrome —— 用空 profile 启动的 Chrome 没有 cookie/登录态，
-            # Turnstile 会拒绝。提示用户用带 --remote-debugging-port 的方式启动自己的 Chrome。
-            print(f'CDP: Chrome 不可用（localhost:{CDP_PORT}）。请先启动: google-chrome-stable --remote-debugging-port={CDP_PORT}', flush=True)
-            print('CDP: 提示: 需要用你自己的 Chrome（有 cookie/登录态），不要用空 profile', flush=True)
+            print(f'CDP: Chrome 不可用（localhost:{CDP_PORT}）。请先启动 Chrome。', flush=True)
             return ''
 
-        # 获取或创建 tab
+        # 创建新 tab
+        tab_id = ''
+        ws_url = ''
         try:
-            resp = urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/list', timeout=3)
-            tabs = json.loads(resp.read())
-            print(f'CDP: 找到 {len(tabs)} 个 tab', flush=True)
-            # 找到一个可用的 tab
-            ws_url = None
-            for tab in tabs:
-                if tab.get('type') == 'page':
-                    ws_url = tab.get('webSocketDebuggerUrl')
-                    break
+            create_req = _urlreq.Request(
+                f'http://localhost:{CDP_PORT}/json/new?about:blank',
+                method='PUT',
+            )
+            create_resp = _urlreq.urlopen(create_req, timeout=5)
+            new_tab = json.loads(create_resp.read())
+            ws_url = new_tab.get('webSocketDebuggerUrl', '')
+            tab_id = new_tab.get('id', '')
             if not ws_url:
-                # 没有 page tab，尝试创建一个
-                print('CDP: 没有 page tab，尝试创建新 tab...', flush=True)
-                try:
-                    create_req = urllib.request.Request(
-                        f'http://localhost:{CDP_PORT}/json/new?about:blank',
-                        method='PUT',
-                    )
-                    create_resp = urllib.request.urlopen(create_req, timeout=5)
-                    new_tab = json.loads(create_resp.read())
-                    ws_url = new_tab.get('webSocketDebuggerUrl')
-                    if ws_url:
-                        print(f'CDP: 创建新 tab 成功', flush=True)
-                    else:
-                        print('CDP: 创建 tab 失败（无 ws_url）', flush=True)
-                        return ''
-                except Exception as exc:
-                    print(f'CDP: 创建 tab 失败: {exc}', flush=True)
-                    return ''
+                print('CDP: 创建 tab 失败（无 ws_url）', flush=True)
+                return ''
+            print('CDP: 创建新 tab 成功', flush=True)
         except Exception as exc:
-            print(f'CDP: 获取 tab 列表失败: {exc}', flush=True)
+            print(f'CDP: 创建 tab 失败: {exc}', flush=True)
             return ''
 
-        async with websockets.connect(ws_url, close_timeout=5) as ws:
-            # 导航到站点
-            msg = {"id": 1, "method": "Page.navigate", "params": {"url": site_url}}
-            await ws.send(json.dumps(msg))
-
-            # 等待页面加载
-            for _ in range(10):
-                try:
-                    await asyncio.wait_for(ws.recv(), timeout=2)
-                except:
-                    break
-
-            await asyncio.sleep(3)
-
-            # 检查 Turnstile 是否已加载，如果没有则加载
-            js_check = """
-            (async function() {
-                if (window.turnstile) return 'loaded';
-                // 尝试加载 Turnstile
-                return await new Promise((resolve) => {
-                    const script = document.createElement('script');
-                    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-                    script.async = true;
-                    script.onload = () => {
-                        const poll = (attempts) => {
-                            if (window.turnstile) return resolve('loaded');
-                            if (attempts <= 0) return resolve('failed');
-                            setTimeout(() => poll(attempts - 1), 500);
-                        };
-                        poll(20);
-                    };
-                    script.onerror = () => resolve('error');
-                    document.head.appendChild(script);
-                    setTimeout(() => resolve(!!window.turnstile ? 'loaded' : 'timeout'), 15000);
-                });
-            })()
-            """
-            await ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": js_check, "awaitPromise": True}}))
-            resp = await asyncio.wait_for(ws.recv(), timeout=20)
-            status = json.loads(resp).get('result', {}).get('result', {}).get('value', '')
-            print(f'CDP: Turnstile 加载状态: {status}', flush=True)
-            if status != 'loaded':
-                print(f'CDP: Turnstile 未加载 (status={status})，跳过', flush=True)
-                return ''
-
-            # 渲染 Turnstile 并获取 token
-            js_render = f"""
-            (async function() {{
-                return await new Promise((resolve) => {{
-                    const container = document.createElement('div');
-                    container.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
-                    document.body.appendChild(container);
-                    let widgetId = null;
-                    let settled = false;
-                    const finish = (value) => {{
-                        if (settled) return;
-                        settled = true;
-                        try {{ if (widgetId !== null) window.turnstile.remove(widgetId); }} catch (e) {{}}
-                        container.remove();
-                        resolve(value || '');
-                    }};
-                    try {{
-                        widgetId = window.turnstile.render(container, {{
-                            sitekey: '{site_key}',
-                            callback: (token) => finish(token),
-                            'error-callback': () => finish(''),
-                            'expired-callback': () => finish(''),
-                            'timeout-callback': () => finish(''),
-                        }});
-                    }} catch (e) {{
-                        finish('');
-                    }}
-                    setTimeout(() => finish(''), 30000);
-                }});
-            }})()
-            """
-            await ws.send(json.dumps({"id": 3, "method": "Runtime.evaluate", "params": {"expression": js_render, "awaitPromise": True}}))
-
-            # 等待 token
+        def close_tab():
             try:
-                resp = await asyncio.wait_for(ws.recv(), timeout=CDP_TIMEOUT)
-                token = json.loads(resp).get('result', {}).get('result', {}).get('value', '')
+                _urlreq.urlopen(f'http://localhost:{CDP_PORT}/json/close/{tab_id}', timeout=3)
+            except Exception:
+                pass
+
+        token_result = ''
+        try:
+            async with websockets.connect(ws_url, max_size=10*1024*1024, close_timeout=5) as ws:
+                _msg_id = 0
+                _pending = {}
+
+                async def send_cmd(method, params=None):
+                    nonlocal _msg_id
+                    _msg_id += 1
+                    mid = _msg_id
+                    cmd = {'id': mid, 'method': method}
+                    if params:
+                        cmd['params'] = params
+                    await ws.send(json.dumps(cmd))
+                    # 等待对应 ID 的响应
+                    while True:
+                        resp = await asyncio.wait_for(ws.recv(), timeout=30)
+                        data = json.loads(resp)
+                        if data.get('id') == mid:
+                            return data
+                        # 丢弃事件通知等非 ID 响应
+
+                # 启用 Page 事件
+                await send_cmd('Page.enable')
+
+                # 导航到站点
+                await send_cmd('Page.navigate', {'url': site_url})
+
+                # 等待页面加载
+                await asyncio.sleep(6)
+
+                # 检查 Turnstile 是否已加载
+                check_result = await send_cmd('Runtime.evaluate', {
+                    'expression': '!!window.turnstile',
+                    'returnByValue': True,
+                })
+                has_ts = check_result.get('result', {}).get('result', {}).get('value', False)
+
+                if not has_ts:
+                    # 注入 Turnstile 脚本
+                    inject_js = """
+                    (function() {
+                        if (window.turnstile) return 'already_loaded';
+                        var s = document.createElement('script');
+                        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+                        s.async = true;
+                        document.head.appendChild(s);
+                        return 'injecting';
+                    })()
+                    """
+                    inject_result = await send_cmd('Runtime.evaluate', {
+                        'expression': inject_js,
+                        'returnByValue': True,
+                    })
+                    print(f'CDP: Turnstile 注入: {inject_result.get("result",{}).get("result",{}).get("value")}', flush=True)
+
+                    # 等待加载
+                    for _ in range(15):
+                        await asyncio.sleep(1)
+                        r = await send_cmd('Runtime.evaluate', {
+                            'expression': '!!window.turnstile',
+                            'returnByValue': True,
+                        })
+                        if r.get('result', {}).get('result', {}).get('value'):
+                            has_ts = True
+                            break
+
+                if not has_ts:
+                    print('CDP: Turnstile 未加载', flush=True)
+                    return ''
+
+                print('CDP: Turnstile 已加载', flush=True)
+
+                # 创建 widget 获取 token
+                render_js = f"""
+                (async function() {{
+                    return await new Promise((resolve) => {{
+                        const container = document.createElement('div');
+                        container.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+                        document.body.appendChild(container);
+                        let widgetId = null;
+                        let settled = false;
+                        const finish = (value) => {{
+                            if (settled) return;
+                            settled = true;
+                            try {{ if (widgetId !== null) window.turnstile.remove(widgetId); }} catch (e) {{}}
+                            container.remove();
+                            resolve(value || '');
+                        }};
+                        try {{
+                            widgetId = window.turnstile.render(container, {{
+                                sitekey: '{site_key}',
+                                callback: (token) => finish(token),
+                                'error-callback': () => finish(''),
+                                'expired-callback': () => finish(''),
+                                'timeout-callback': () => finish(''),
+                            }});
+                        }} catch (e) {{
+                            finish('');
+                        }}
+                        setTimeout(() => finish(''), 30000);
+                    }});
+                }})()
+                """
+                render_result = await send_cmd('Runtime.evaluate', {
+                    'expression': render_js,
+                    'awaitPromise': True,
+                })
+                token = render_result.get('result', {}).get('result', {}).get('value', '')
                 print(f'CDP: 获取到 token: {repr(token[:40] if token else "<empty>")}', flush=True)
-                return token or ''
-            except Exception as exc:
-                print(f'CDP: 等待 token 超时或异常: {exc}', flush=True)
-                return ''
+                token_result = token or ''
+
+        except Exception as exc:
+            print(f'CDP: 异常: {exc}', flush=True)
+        finally:
+            close_tab()
+
+        return token_result
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(_get_token())
-        finally:
-            loop.close()
-    except Exception:
-        return ''
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(lambda: asyncio.run(_get_token())).result(timeout=CDP_TIMEOUT + 30)
+    else:
+        return asyncio.run(_get_token())
 
 
 def checkin_via_browser(site_url: str, session: str, cf_clearance: str = '', user_id: str = '', access_token: str = '') -> dict:
@@ -979,7 +995,9 @@ def checkin(site_url: str, session: str, cf_clearance: str = '', user_id: str = 
                     },
                 }
                 cdp_result['classification'] = classify_result(resp.status_code, cdp_body, cdp_result.get('debug'))
-                return cdp_result
+                if cdp_result['classification'].get('kind') != 'cloudflare_challenge':
+                    return cdp_result
+                print('CDP 签到仍被 Cloudflare 拦截，继续走浏览器兜底...')
             except Exception as exc:
                 print(f'CDP 签到失败: {exc}')
         else:
