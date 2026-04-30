@@ -20,7 +20,7 @@ from scrapling.fetchers import StealthyFetcher
 CHECKIN_PATH = '/api/user/checkin'
 REQUEST_TIMEOUT = 30
 MAX_POW_NONCE = 1_000_000
-CDP_PORT = 9222
+CDP_PORT = 19825
 CDP_TIMEOUT = 45
 
 
