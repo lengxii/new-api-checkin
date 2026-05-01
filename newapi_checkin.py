@@ -22,6 +22,55 @@ REQUEST_TIMEOUT = 30
 MAX_POW_NONCE = 1_000_000
 CDP_PORT = 19825
 CDP_TIMEOUT = 45
+CDP_START_SCRIPT = '/root/scripts/start-bb-browser.sh'
+
+
+def ensure_cdp_ready(max_wait: int = 20) -> bool:
+    """检查 CDP Chrome 是否可用，不可用则自动重启 Xvfb + Chrome。返回是否就绪。"""
+    import subprocess as _sp
+    import urllib.request as _urlreq
+
+    # 1. 快速探活
+    try:
+        _urlreq.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=3)
+        return True  # 已就绪
+    except Exception:
+        pass
+
+    # 2. 不可用，自动重启
+    print('CDP: Chrome 不可用，正在自动重启...', flush=True)
+
+    start_script = CDP_START_SCRIPT
+    if not os.path.exists(start_script):
+        print(f'CDP: 启动脚本不存在: {start_script}', flush=True)
+        return False
+
+    try:
+        proc = _sp.run(
+            ['bash', start_script],
+            capture_output=True, text=True, timeout=30,
+            cwd='/root',
+            env={**os.environ, 'DISPLAY': ':99'},
+        )
+        if proc.returncode != 0:
+            print(f'CDP: 启动脚本退出码 {proc.returncode}: {proc.stderr[:200]}', flush=True)
+    except _sp.TimeoutExpired:
+        print('CDP: 启动脚本超时(30s)', flush=True)
+    except Exception as exc:
+        print(f'CDP: 启动脚本异常: {exc}', flush=True)
+
+    # 3. 等待 CDP 就绪
+    for i in range(max_wait):
+        time.sleep(1)
+        try:
+            _urlreq.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=3)
+            print(f'CDP: Chrome 已就绪 (等待 {i+1}s)', flush=True)
+            return True
+        except Exception:
+            pass
+
+    print(f'CDP: 等待 {max_wait}s 后仍不可用', flush=True)
+    return False
 
 
 def normalize_url(url: str) -> str:
@@ -958,9 +1007,13 @@ def checkin(site_url: str, session: str, cf_clearance: str = '', user_id: str = 
 
     if turnstile_enabled and not turnstile_provided and turnstile_site_key:
         print('尝试通过桌面 Chrome 获取 Turnstile token...')
-        normalized_url = normalize_url(site_url)
-        cdp_cookie_domain = build_cookie_domain(normalized_url)
-        cdp_token = get_turnstile_token_via_cdp(site_url, turnstile_site_key, session=session, cookie_domain=cdp_cookie_domain)
+        cdp_token = ''
+        if not ensure_cdp_ready():
+            print('CDP: 自动恢复失败，跳过 Turnstile token 获取')
+        else:
+            normalized_url = normalize_url(site_url)
+            cdp_cookie_domain = build_cookie_domain(normalized_url)
+            cdp_token = get_turnstile_token_via_cdp(site_url, turnstile_site_key, session=session, cookie_domain=cdp_cookie_domain)
         if cdp_token:
             print(f'CDP Turnstile token 获取成功: {cdp_token[:30]}...')
             # 使用 CDP token 重新签到
