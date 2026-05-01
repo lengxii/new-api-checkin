@@ -453,7 +453,7 @@ def _checkin_via_requests_impl(site_url: str, session: str, cf_clearance: str = 
     }
 
 
-def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
+def get_turnstile_token_via_cdp(site_url: str, site_key: str, session: str = '', cookie_domain: str = '') -> str:
     """通过 CDP 连接桌面 Chrome 获取 Turnstile token"""
     import asyncio
 
@@ -521,8 +521,19 @@ def get_turnstile_token_via_cdp(site_url: str, site_key: str) -> str:
                             return data
                         # 丢弃事件通知等非 ID 响应
 
-                # 启用 Page 事件
+                # 启用 Network 和 Page 事件
+                await send_cmd('Network.enable')
                 await send_cmd('Page.enable')
+
+                # 注入 session cookie（在导航前设置，确保页面加载时已登录）
+                if session and cookie_domain:
+                    await send_cmd('Network.setCookie', {
+                        'name': 'session',
+                        'value': session,
+                        'domain': cookie_domain,
+                        'path': '/',
+                    })
+                    print(f'CDP: 已注入 session cookie (domain={cookie_domain})', flush=True)
 
                 # 导航到站点
                 await send_cmd('Page.navigate', {'url': site_url})
@@ -947,7 +958,9 @@ def checkin(site_url: str, session: str, cf_clearance: str = '', user_id: str = 
 
     if turnstile_enabled and not turnstile_provided and turnstile_site_key:
         print('尝试通过桌面 Chrome 获取 Turnstile token...')
-        cdp_token = get_turnstile_token_via_cdp(site_url, turnstile_site_key)
+        normalized_url = normalize_url(site_url)
+        cdp_cookie_domain = build_cookie_domain(normalized_url)
+        cdp_token = get_turnstile_token_via_cdp(site_url, turnstile_site_key, session=session, cookie_domain=cdp_cookie_domain)
         if cdp_token:
             print(f'CDP Turnstile token 获取成功: {cdp_token[:30]}...')
             # 使用 CDP token 重新签到
