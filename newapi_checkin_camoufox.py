@@ -282,7 +282,7 @@ def try_checkin_via_http(base_url, session, user_id, access_token):
         except Exception:
             pass
 
-    client = cf_requests.Session(impersonate='chrome', timeout=20)
+    client = cf_requests.Session(impersonate='chrome110', timeout=20, proxy={})
 
     try:
         # 获取站点配置
@@ -704,7 +704,7 @@ def checkin(base_url, session, user_id, access_token, headless=True):
                     headers["Cookie"] = f"session={session}"
                 checkin_url = build_checkin_url(base_url) + f"?turnstile={turnstile_token}"
                 try:
-                    client = cf_requests.Session(impersonate='chrome', timeout=20)
+                    client = cf_requests.Session(impersonate='chrome110', timeout=20, proxy={})
                     resp = client.post(checkin_url, headers=headers, json={})
                     body = resp.json()
 

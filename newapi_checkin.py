@@ -120,7 +120,7 @@ def requests_headers(user_id: str = '', access_token: str = '') -> dict:
 def create_requests_session(base_url: str, session: str, cf_clearance: str = '', user_id: str = '', access_token: str = '') -> requests.Session:
     normalized_url = normalize_url(base_url)
     host = urlparse(normalized_url).netloc.split(':')[0]
-    sess = requests.Session(impersonate='chrome')
+    sess = requests.Session(impersonate='chrome110', proxy={})
     headers = requests_headers(user_id, access_token)
     headers['Origin'] = normalized_url.rstrip('/')
     headers['Referer'] = normalized_url
