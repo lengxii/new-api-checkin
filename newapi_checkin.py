@@ -11,9 +11,10 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from urllib.parse import urlencode, urlparse
 
-import requests
+from curl_cffi import requests
 from scrapling.fetchers import StealthyFetcher
 
 
@@ -119,7 +120,7 @@ def requests_headers(user_id: str = '', access_token: str = '') -> dict:
 def create_requests_session(base_url: str, session: str, cf_clearance: str = '', user_id: str = '', access_token: str = '') -> requests.Session:
     normalized_url = normalize_url(base_url)
     host = urlparse(normalized_url).netloc.split(':')[0]
-    sess = requests.Session()
+    sess = requests.Session(impersonate='chrome')
     headers = requests_headers(user_id, access_token)
     headers['Origin'] = normalized_url.rstrip('/')
     headers['Referer'] = normalized_url
@@ -429,6 +430,38 @@ def _checkin_via_requests_impl(site_url: str, session: str, cf_clearance: str = 
     body = parse_json_response(resp)
     if body is None:
         body = resp.text
+
+    # ── 签名重试：部分站点要求 X-Checkin-Timestamp + X-Checkin-Signature ──
+    if (
+        isinstance(body, dict)
+        and not body.get('success')
+        and '签名' in str(body.get('message') or '')
+        and str(user_id or '').strip()
+    ):
+        import hashlib as _hashlib
+        now_str = datetime.now().strftime('%Y-%m')
+        nonce_url = f'{base}/api/user/checkin?month={now_str}'
+        nonce_resp = req_session.get(nonce_url, timeout=REQUEST_TIMEOUT)
+        nonce_body = parse_json_response(nonce_resp) or {}
+        nonce_data = nonce_body.get('data') or {}
+        nonce = nonce_data.get('checkin_nonce', '')
+        if nonce:
+            ts = str(int(time.time()))
+            sig_input = f'{user_id}:{ts}:{nonce}'
+            signature = _hashlib.sha256(sig_input.encode()).hexdigest()
+            sign_headers = {
+                'X-Checkin-Timestamp': ts,
+                'X-Checkin-Signature': signature,
+            }
+            merged_headers = dict(request_headers or {})
+            merged_headers.update(sign_headers)
+            resp = req_session.post(checkin_url, headers=merged_headers, timeout=REQUEST_TIMEOUT)
+            body = parse_json_response(resp)
+            if body is None:
+                body = resp.text
+            # 把签名信息写入后续 debug
+            pow_payload = pow_payload  # keep existing
+            request_headers = merged_headers
 
     if (
         not pow_payload
