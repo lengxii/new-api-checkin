@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -240,6 +241,8 @@ def classify_result(status: int, body: dict, debug: dict = None) -> dict:
     if status == 403:
         return {"status": "cf_blocked", "message": msg}
     if "安全验证" in msg:
+        return {"status": "pow_required", "message": msg}
+    if "完整性" in msg or "完整性标记" in msg:
         return {"status": "pow_required", "message": msg}
 
     return {"status": "error", "message": msg, "http_status": status}
@@ -629,6 +632,10 @@ async def checkin_with_camoufox(
                                     result = classify_result(pow_checkin_result.get("status", 0), pow_checkin_result.get("data", {}))
                                     result["http_status"] = pow_checkin_result.get("status", 0)
                                     result["mode"] = "camoufox+pow"
+                                    print(f"📤 PoW 签到结果: status={result.get('status')}, msg={result.get('message', '')[:60]}")
+                                    print(f"📤 原始返回: {json.dumps(pow_checkin_result.get('data', {}), ensure_ascii=False)[:200]}")
+                                else:
+                                    print(f"❌ PoW 签到 fetch 失败: {pow_checkin_result.get('error', '')}")
 
                 # 缓存 cf_clearance
                 try:
@@ -648,6 +655,122 @@ async def checkin_with_camoufox(
             result = {"status": "error", "message": f"Camoufox 异常: {e}"}
 
     return result
+
+
+async def checkin_via_ui(base_url, session, user_id, access_token, headless=True) -> dict:
+    """
+    通过浏览器 UI 执行签到（适用于 arkapi 等需要前端 PoW captcha 的站点）。
+    流程：导航到个人中心 → 点击签到按钮 → 点击 PoW captcha → 等待验证通过。
+    """
+    normalized = normalize_url(base_url)
+    domain = urlparse(base_url).hostname
+    result = {"status": "error", "message": "UI 签到失败"}
+
+    if not HAS_CAMOUFOX:
+        return {"status": "error", "message": "Camoufox 未安装"}
+
+    with tempfile.TemporaryDirectory(prefix="camoufox_ui_") as tmp_dir:
+        try:
+            async with AsyncCamoufox(
+                user_data_dir=tmp_dir, persistent_context=True,
+                headless=headless, humanize=True, locale="zh-CN",
+                disable_coop=True, config={"forceScopeAccess": True},
+                i_know_what_im_doing=True,
+            ) as browser:
+                page = await browser.new_page()
+
+                # 注入 session cookie 和 localStorage（必须在页面加载前设置）
+                if session:
+                    await browser.add_cookies([{"name": "session", "value": session, "domain": domain, "path": "/"}])
+
+                # 在 SPA 初始化前注入 localStorage（必须包含 id 和 username，否则 New-API-User header 不匹配）
+                user_obj = json.dumps({"id": int(user_id), "username": "", "display_name": "", "role": 1, "status": 1, "token": access_token, "group": "default"})
+                # Escape single quotes in the JSON for the JS string
+                user_obj_escaped = user_obj.replace("\\", "\\\\").replace("'", "\\'")
+                await page.add_init_script(
+                    f"try {{ localStorage.setItem('user', '{user_obj_escaped}'); }} catch(e) {{}}"
+                )
+
+                # 直接导航到个人中心
+                print(f"🌐 导航到个人中心")
+                await page.goto(normalized + "console/personal", wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(8000)
+
+                # 检查是否已签到
+                already = await page.evaluate("""() => {
+                    const body = document.body?.innerText || '';
+                    return body.includes('今日已签到');
+                }""")
+                if already:
+                    print("✅ 今日已签到")
+                    return {"status": "already", "message": "今日已签到"}
+
+                # 点击"立即签到"按钮
+                try:
+                    await page.get_by_text("立即签到").first.click(timeout=10000)
+                    print("📤 点击了'立即签到'")
+                except Exception:
+                    # 尝试其他签到按钮
+                    try:
+                        await page.get_by_text("签到").first.click(timeout=5000)
+                        print("📤 点击了'签到'")
+                    except Exception as e:
+                        return {"status": "error", "message": f"找不到签到按钮: {e}"}
+
+                await page.wait_for_timeout(2000)
+
+                # 检查是否弹出 PoW captcha
+                has_pow = await page.evaluate("""() => {
+                    return !!document.querySelector('.pow-captcha, .pow-icon');
+                }""")
+
+                if has_pow:
+                    print("🔐 检测到 PoW captcha，点击求解...")
+                    try:
+                        await page.locator(".pow-icon").click(timeout=5000)
+                    except Exception:
+                        # 备选：点击 pow-captcha 内的可点击元素
+                        await page.evaluate("""() => {
+                            const el = document.querySelector('.pow-icon, .pow-captcha [role="button"]');
+                            if (el) el.click();
+                        }""")
+
+                    # 等待 PoW 求解完成（最多 30 秒）
+                    for _ in range(30):
+                        await page.wait_for_timeout(1000)
+                        state = await page.evaluate("""() => {
+                            const glow = document.querySelector('.pow-glow');
+                            const label = document.querySelector('.pow-label');
+                            const modal = document.querySelector('.semi-modal-body');
+                            return {
+                                width: glow?.style?.width || '',
+                                label: label?.textContent?.trim() || '',
+                                modalVisible: !!modal
+                            };
+                        }""")
+                        if state["label"] == "验证通过" or not state["modalVisible"]:
+                            print(f"✅ PoW 验证通过")
+                            break
+
+                await page.wait_for_timeout(3000)
+
+                # 检查最终结果
+                final = await page.evaluate("""() => {
+                    const body = document.body?.innerText || '';
+                    return {
+                        checkedIn: body.includes('今日已签到') || body.includes('签到成功'),
+                        bodySnippet: body.substring(0, 300)
+                    };
+                }""")
+
+                if final["checkedIn"]:
+                    print("✅ UI 签到成功")
+                    return {"status": "success", "message": "签到成功 (UI)", "mode": "camoufox-ui"}
+
+                return {"status": "error", "message": "UI 签到未确认成功"}
+
+        except Exception as e:
+            return {"status": "error", "message": f"UI 签到异常: {e}"}
 
 
 # ═══════════════════════════════════════════
@@ -754,6 +877,35 @@ def checkin(base_url, session, user_id, access_token, headless=True):
             headless=headless,
         ))
         result["mode"] = "camoufox"
+
+        # Step 3b: 如果 Camoufox API 签到返回 game_integrity_missing_action，
+        # 说明该站点需要通过浏览器 UI 点击签到（如 arkapi）
+        msg = result.get("message", "")
+        if result.get("status") == "pow_required" and "完整性" in msg:
+            print("🔄 检测到完整性验证要求，改用 CDP Chrome UI 签到...")
+            import subprocess as _sp
+            cdp_script = Path("/root/scripts/arkapi_cdp_checkin.py")
+            if cdp_script.exists():
+                try:
+                    cp = _sp.run(
+                        [sys.executable, str(cdp_script),
+                         "--session", session, "--access-token", access_token,
+                         "--user-id", str(user_id), "--url", base_url],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    combined = (cp.stdout + cp.stderr).strip()
+                    print(combined)
+                    if "今日已签到" in combined:
+                        result = {"status": "already", "message": "今日已签到", "mode": "cdp-ui"}
+                    elif "签到成功" in combined:
+                        result = {"status": "success", "message": "签到成功 (CDP Chrome)", "mode": "cdp-ui"}
+                    else:
+                        result = {"status": "error", "message": f"CDP 签到失败: {combined[:100]}"}
+                except Exception as e:
+                    result = {"status": "error", "message": f"CDP 签到异常: {e}"}
+            else:
+                print("⚠️ CDP 签到脚本不存在")
+
         return result
 
     return result or {"status": "error", "message": "无可用签到方式"}

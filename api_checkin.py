@@ -28,6 +28,8 @@ from urllib.parse import urlparse
 SITES_FILE = Path.home() / '.hermes' / 'api_sites.json'
 STATUS_FILE = Path.home() / '.hermes' / 'api_checkin_status.json'
 CHECKIN_SCRIPT = Path('/root/scripts/newapi_checkin.py')
+CAMOUFOX_SCRIPT = Path('/root/scripts/newapi_checkin_camoufox.py')
+CDP_ARKAPI_SCRIPT = Path('/root/scripts/arkapi_cdp_checkin.py')
 VENV_PYTHON = Path.home() / '.venvs' / 'scrapling' / 'bin' / 'python'
 FALLBACK_PYTHON = 'python3'
 PATCHRIGHT_BROWSERS = Path.home() / '.cache' / 'patchright-browsers'
@@ -715,6 +717,33 @@ def run_checkin_with_fallback(site: dict, *, user_id_override=None):
         if completed.returncode != 0 and 'modulenotfounderror: no module named' in combined_output and python_cmd != FALLBACK_PYTHON:
             last_completed = completed
             continue
+
+        # 检测 game_integrity_missing_action（arkapi 等需要 UI 签到的站点）
+        # 自动用 CDP Chrome 脚本重试（比 Camoufox 更稳定）
+        if ('完整性' in combined_output or 'integrity' in combined_output):
+            # 优先用 CDP arkapi 脚本
+            if CDP_ARKAPI_SCRIPT.exists():
+                print(f'⚠️ 检测到完整性验证要求，改用 CDP Chrome 签到...')
+                for cdp_python in python_candidates:
+                    try:
+                        completed2 = run_checkin_cdp_arkapi(site, cdp_python, user_id_override=user_id_override)
+                        return completed2
+                    except FileNotFoundError:
+                        continue
+                    except Exception:
+                        continue
+            # 备选用 Camoufox 脚本
+            if CAMOUFOX_SCRIPT.exists():
+                print(f'⚠️ CDP 不可用，改用 Camoufox 脚本重试...')
+                for camoufox_python in python_candidates:
+                    try:
+                        completed2 = run_checkin_camoufox(site, camoufox_python, user_id_override=user_id_override)
+                        return completed2
+                    except FileNotFoundError:
+                        continue
+                    except Exception:
+                        continue
+
         return completed
 
     if last_completed is not None:
@@ -722,6 +751,58 @@ def run_checkin_with_fallback(site: dict, *, user_id_override=None):
     if last_error is not None:
         raise last_error
     raise FileNotFoundError('未找到可用的 Python 解释器')
+
+
+def run_checkin_camoufox(site: dict, python_cmd, *, user_id_override=None):
+    """使用 Camoufox 脚本执行签到（支持 UI 签到）"""
+    command = [
+        'xvfb-run', '-a',
+        str(python_cmd),
+        str(CAMOUFOX_SCRIPT),
+        '--url',
+        site['url'],
+        '--session',
+        site['session'],
+    ]
+    cf_value = site.get('cf', '')
+    if cf_value:
+        command.extend(['--cf', cf_value])
+    user_id = user_id_override if user_id_override is not None else site.get('user_id')
+    if user_id:
+        command.extend(['--user-id', str(user_id)])
+    if site.get('access_token'):
+        command.extend(['--access-token', site['access_token']])
+
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd='/root',
+        env=_env_with_patchright(),
+    )
+
+
+def run_checkin_cdp_arkapi(site: dict, python_cmd, *, user_id_override=None):
+    """使用 CDP Chrome 执行 arkapi UI 签到"""
+    user_id = user_id_override if user_id_override is not None else site.get('user_id')
+    command = [
+        str(python_cmd),
+        str(CDP_ARKAPI_SCRIPT),
+        '--session', site['session'],
+        '--access-token', site.get('access_token', ''),
+        '--user-id', str(user_id or '3084'),
+        '--url', site['url'],
+    ]
+
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd='/root',
+        env=_env_with_patchright(),
+    )
 
 
 def is_checkin_success(completed: subprocess.CompletedProcess, output: str) -> bool:
