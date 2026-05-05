@@ -45,10 +45,11 @@ def _env_with_patchright() -> dict:
 # Import shared normalize_url from newapi_checkin (lenient wrapper)
 sys.path.insert(0, '/root/scripts')
 import newapi_checkin as _ec
-KNOWN_DOMAINS = {
+KNOWNS = KNOWN_DOMAINS = {
     'elysiver.h-e.top': 'elysiver',
     'windhub.cc': 'windhub',
     'ptlmon.com': 'ptlmon',
+    'keungliang.dpdns.org': 'newcross',
 }
 
 COOKIE_FIELD_ALIASES = {
