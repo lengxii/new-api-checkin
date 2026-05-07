@@ -33,6 +33,7 @@ CDP_ARKAPI_SCRIPT = Path('/root/scripts/arkapi_cdp_checkin.py')
 VENV_PYTHON = Path.home() / '.venvs' / 'scrapling' / 'bin' / 'python'
 FALLBACK_PYTHON = 'python3'
 PATCHRIGHT_BROWSERS = Path.home() / '.cache' / 'patchright-browsers'
+CDP_START_SCRIPT = Path('/root/scripts/start-bb-browser.sh')
 
 
 def _env_with_patchright() -> dict:
@@ -714,32 +715,51 @@ def run_checkin_with_fallback(site: dict, *, user_id_override=None):
             last_error = exc
             continue
 
-        combined_output = '\n'.join(part for part in [completed.stdout, completed.stderr] if part).lower()
-        if completed.returncode != 0 and 'modulenotfounderror: no module named' in combined_output and python_cmd != FALLBACK_PYTHON:
+        combined_output = '\n'.join(part for part in [completed.stdout, completed.stderr] if part)
+        combined_output_lower = combined_output.lower()
+        if completed.returncode != 0 and 'modulenotfounderror: no module named' in combined_output_lower and python_cmd != FALLBACK_PYTHON:
             last_completed = completed
             continue
 
+        should_try_arkapi_auto_retry = (
+            site.get('name') == 'arkapi'
+            and not is_checkin_success(completed, combined_output)
+        )
+        if should_try_arkapi_auto_retry:
+            integrity_markers = ['完整性', 'integrity', 'game_integrity_missing_action']
+            should_try_arkapi_auto_retry = any(marker in combined_output_lower or marker in combined_output for marker in integrity_markers)
+
         # 检测 game_integrity_missing_action（arkapi 等需要 UI 签到的站点）
         # 自动用 CDP Chrome 脚本重试（比 Camoufox 更稳定）
-        if ('完整性' in combined_output or 'integrity' in combined_output):
+        if should_try_arkapi_auto_retry:
             # 优先用 CDP arkapi 脚本
             if CDP_ARKAPI_SCRIPT.exists():
-                print(f'⚠️ 检测到完整性验证要求，改用 CDP Chrome 签到...')
-                for cdp_python in python_candidates:
-                    try:
-                        completed2 = run_checkin_cdp_arkapi(site, cdp_python, user_id_override=user_id_override)
-                        return completed2
-                    except FileNotFoundError:
-                        continue
-                    except Exception:
-                        continue
+                print('⚠️ 检测到 arkapi 完整性验证要求，自动执行 CDP UI 补签...')
+                cdp_ready = ensure_cdp_browser_ready()
+                if not cdp_ready:
+                    print('⚠️ CDP Chrome 自动拉起失败，准备回退到 Camoufox 补签...')
+                else:
+                    for cdp_python in python_candidates:
+                        try:
+                            completed2 = run_checkin_cdp_arkapi(site, cdp_python, user_id_override=user_id_override)
+                            retry_output = '\n'.join(part for part in [completed2.stdout, completed2.stderr] if part)
+                            if is_checkin_success(completed2, retry_output):
+                                return completed2
+                            last_completed = completed2
+                        except FileNotFoundError:
+                            continue
+                        except Exception:
+                            continue
             # 备选用 Camoufox 脚本
             if CAMOUFOX_SCRIPT.exists():
-                print(f'⚠️ CDP 不可用，改用 Camoufox 脚本重试...')
+                print('⚠️ CDP UI 补签不可用，自动改用 Camoufox 补签...')
                 for camoufox_python in python_candidates:
                     try:
                         completed2 = run_checkin_camoufox(site, camoufox_python, user_id_override=user_id_override)
-                        return completed2
+                        retry_output = '\n'.join(part for part in [completed2.stdout, completed2.stderr] if part)
+                        if is_checkin_success(completed2, retry_output):
+                            return completed2
+                        last_completed = completed2
                     except FileNotFoundError:
                         continue
                     except Exception:
@@ -806,6 +826,47 @@ def run_checkin_cdp_arkapi(site: dict, python_cmd, *, user_id_override=None):
     )
 
 
+def ensure_cdp_browser_ready() -> bool:
+    if not CDP_START_SCRIPT.exists():
+        return False
+
+    def _probe_ready() -> bool:
+        try:
+            probe = subprocess.run(
+                ['curl', '-fsS', 'http://127.0.0.1:19825/json/version'],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd='/root',
+            )
+            return probe.returncode == 0
+        except Exception:
+            return False
+
+    if _probe_ready():
+        return True
+
+    try:
+        subprocess.run(
+            ['bash', str(CDP_START_SCRIPT)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd='/root',
+        )
+    except Exception:
+        return False
+
+    for _ in range(10):
+        if _probe_ready():
+            return True
+        try:
+            subprocess.run(['sleep', '1'], timeout=2)
+        except Exception:
+            pass
+    return False
+
+
 def is_checkin_success(completed: subprocess.CompletedProcess, output: str) -> bool:
     text = (output or '').strip()
     if completed.returncode != 0:
@@ -868,11 +929,14 @@ def cmd_qd(raw: str):
                 success_count += 1
                 if success_state:
                     classification = 'already_checked_in' if success_state == 'already_checked_in' else 'success'
+                    message = '今日已签到' if success_state == 'already_checked_in' else '签到成功'
+                    if 'cdp ui 补签' in output.lower() or 'cdp-ui' in output.lower():
+                        message = '签到成功 (CDP UI 自动补签)'
                     update_cached_status(site['name'], {
                         'date': today,
                         'state': success_state,
                         'classification': classification,
-                        'message': '今日已签到' if success_state == 'already_checked_in' else '签到成功',
+                        'message': message,
                         'updated_at': subprocess.run(
                             ['date', '+%F %T'],
                             capture_output=True,

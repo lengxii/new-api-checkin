@@ -884,8 +884,65 @@ def checkin(base_url, session, user_id, access_token, headless=True):
         if result.get("status") == "pow_required" and "完整性" in msg:
             print("🔄 检测到完整性验证要求，改用 CDP Chrome UI 签到...")
             import subprocess as _sp
+
+            # 确保 CDP Chrome 已启动
+            cdp_start_script = Path("/root/scripts/start-bb-browser.sh")
+            cdp_ready = False
+            try:
+                cdp_probe = _sp.run(
+                    ["curl", "-fsS", "http://127.0.0.1:19825/json/version"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                cdp_ready = cdp_probe.returncode == 0
+            except Exception:
+                pass
+
+            if not cdp_ready and cdp_start_script.exists():
+                print("🔧 CDP Chrome 未运行，自动启动...")
+                try:
+                    # 直接启动 Chrome，不走 start-bb-browser.sh（daemon 部分可能卡住）
+                    chrome_bin = _sp.run(
+                        ["find", "/root/.agent-browser/browsers", "-name", "chrome", "-type", "f"],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip().split("\n")[0]
+                    if chrome_bin:
+                        _sp.Popen(
+                            [chrome_bin,
+                             "--remote-debugging-port=19825",
+                             "--remote-allow-origins=*",
+                             "--user-data-dir=/tmp/chrome-cdp-profile",
+                             "--no-first-run", "--no-default-browser-check",
+                             "--no-sandbox", "--disable-gpu",
+                             "--window-size=1280,720"],
+                            env={**os.environ, "DISPLAY": ":99"},
+                            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                        )
+                    # 等待 CDP 就绪
+                    for _ in range(15):
+                        try:
+                            cdp_probe = _sp.run(
+                                ["curl", "-fsS", "http://127.0.0.1:19825/json/version"],
+                                capture_output=True, text=True, timeout=3,
+                            )
+                            if cdp_probe.returncode == 0:
+                                print("✅ CDP Chrome 已就绪")
+                                cdp_ready = True
+                                break
+                        except Exception:
+                            pass
+                        try:
+                            _sp.run(["sleep", "1"], timeout=2)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"⚠️ CDP Chrome 启动失败: {e}")
+
+            if not cdp_ready:
+                print("⚠️ CDP Chrome 不可用，跳过 UI 补签")
+                result = {"status": "error", "message": "CDP Chrome 不可用，无法完成完整性验证签到"}
+
             cdp_script = Path("/root/scripts/arkapi_cdp_checkin.py")
-            if cdp_script.exists():
+            if cdp_script.exists() and cdp_ready:
                 try:
                     cp = _sp.run(
                         [sys.executable, str(cdp_script),
@@ -896,14 +953,14 @@ def checkin(base_url, session, user_id, access_token, headless=True):
                     combined = (cp.stdout + cp.stderr).strip()
                     print(combined)
                     if "今日已签到" in combined:
-                        result = {"status": "already", "message": "今日已签到", "mode": "cdp-ui"}
+                        result = {"status": "already", "message": "今日已签到 (CDP UI 补签)", "mode": "cdp-ui"}
                     elif "签到成功" in combined:
-                        result = {"status": "success", "message": "签到成功 (CDP Chrome)", "mode": "cdp-ui"}
+                        result = {"status": "success", "message": "签到成功 (CDP Chrome 补签)", "mode": "cdp-ui"}
                     else:
-                        result = {"status": "error", "message": f"CDP 签到失败: {combined[:100]}"}
+                        result = {"status": "error", "message": f"CDP 签到失败: {combined[:200]}"}
                 except Exception as e:
                     result = {"status": "error", "message": f"CDP 签到异常: {e}"}
-            else:
+            elif not cdp_script.exists():
                 print("⚠️ CDP 签到脚本不存在")
 
         return result
